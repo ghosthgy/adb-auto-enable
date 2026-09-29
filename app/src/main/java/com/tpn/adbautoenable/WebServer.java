@@ -53,6 +53,12 @@ public class WebServer extends NanoHTTPD {
             return handleSwitch();
         } else if (uri.equals("/api/port") && method == Method.POST) {
             return handleSetPort(session);
+        } else if (uri.equals("/api/custom_commands") && method == Method.POST) {
+            return handleSaveCustomCommands(session);
+        } else if (uri.equals("/api/run_custom_commands") && method == Method.POST) {
+            return handleRunCustomCommands();
+        } else if (uri.equals("/api/exec") && method == Method.POST) {
+            return handleExecCommand(session);
         } else if (uri.equals("/api/logs")) {
             return handleLogs();
         } else if (uri.equals("/api/reset") && method == Method.POST) {
@@ -187,6 +193,27 @@ public class WebServer extends NanoHTTPD {
         }
     }
 
+    private String escapeJson(String input) {
+        if (input == null) return "";
+        return input.replace("\\", "\\\\")
+                .replace("\"", "\\\"")
+                .replace("\n", "\\n")
+                .replace("\r", "\\r")
+                .replace("\t", "\\t");
+    }
+
+    private int getActiveAdbPort() {
+        int currentPort = getCurrentPort();
+        if (currentPort > 0) {
+            return currentPort;
+        }
+        int targetPort = getTargetPort();
+        if (checkTargetPortAvailable()) {
+            return targetPort;
+        }
+        return discoverAdbPort();
+    }
+
     private Response handleStatus() {
         Log.d(TAG, "handleStatus() called - checking status");
         SharedPreferences prefs = getPrefs();
@@ -195,15 +222,107 @@ public class WebServer extends NanoHTTPD {
         int targetPort = getTargetPort();
         int currentPort = getCurrentPort();
         boolean webServerEnabled = prefs.getBoolean("web_server_enabled", true);
+        String customCommands = prefs.getString("custom_commands", "");
+        boolean customCommandsOnBoot = prefs.getBoolean("custom_commands_on_boot", true);
 
         boolean adbTargetAvailable = checkTargetPortAvailable();
 
         String json = String.format(Locale.US,
-                "{\"lastStatus\":\"%s\",\"currentPort\":%d,\"isPaired\":%b,\"adb5555Available\":%b,\"targetPort\":%d,\"webServerEnabled\":%b}",
-                lastStatus, currentPort, isPaired, adbTargetAvailable, targetPort, webServerEnabled
+                "{\"lastStatus\":\"%s\",\"currentPort\":%d,\"isPaired\":%b,\"adb5555Available\":%b,\"targetPort\":%d,\"webServerEnabled\":%b,\"customCommands\":\"%s\",\"customCommandsOnBoot\":%b}",
+                escapeJson(lastStatus), currentPort, isPaired, adbTargetAvailable, targetPort, webServerEnabled, escapeJson(customCommands), customCommandsOnBoot
         );
         Log.d(TAG, "handleStatus() completed");
         return newFixedLengthResponse(Response.Status.OK, "application/json", json);
+    }
+
+    private Response handleSaveCustomCommands(IHTTPSession session) {
+        try {
+            Map<String, String> files = new HashMap<>();
+            session.parseBody(files);
+            Map<String, List<String>> params = session.getParameters();
+            List<String> cmdList = params.get("commands");
+            List<String> onBootList = params.get("onBoot");
+
+            String commands = (cmdList != null && !cmdList.isEmpty()) ? cmdList.get(0) : "";
+            boolean onBoot = (onBootList != null && !onBootList.isEmpty()) ? Boolean.parseBoolean(onBootList.get(0)) : true;
+
+            SharedPreferences prefs = getPrefs();
+            prefs.edit()
+                    .putString("custom_commands", commands)
+                    .putBoolean("custom_commands_on_boot", onBoot)
+                    .apply();
+
+            Log.i(TAG, "Web API: Custom commands saved (onBoot=" + onBoot + ")");
+            return newFixedLengthResponse(Response.Status.OK, "application/json",
+                    "{\"success\":true,\"message\":\"Custom commands saved successfully!\"}");
+        } catch (Exception e) {
+            Log.e(TAG, "Web API: Save custom commands error", e);
+            return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "application/json",
+                    "{\"error\":\"" + escapeJson(e.getMessage()) + "\"}");
+        }
+    }
+
+    private Response handleRunCustomCommands() {
+        try {
+            SharedPreferences prefs = getPrefs();
+            String commands = prefs.getString("custom_commands", "");
+            if (commands == null || commands.trim().isEmpty()) {
+                return newFixedLengthResponse(Response.Status.BAD_REQUEST, "application/json",
+                        "{\"error\":\"No custom commands configured. Please add commands above first.\"}");
+            }
+
+            int port = getActiveAdbPort();
+            if (port <= 0) {
+                return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "application/json",
+                        "{\"error\":\"Active ADB port not found. Please ensure Wireless Debugging is paired and enabled.\"}");
+            }
+
+            String deviceIP = getDeviceIP();
+            Log.i(TAG, "Web API: Running custom commands on port " + port);
+            String output = adbHelper.executeCustomCommands(deviceIP, port, commands);
+            Log.i(TAG, "Web API: Custom commands execution finished");
+
+            return newFixedLengthResponse(Response.Status.OK, "application/json",
+                    "{\"success\":true,\"output\":\"" + escapeJson(output) + "\"}");
+        } catch (Exception e) {
+            Log.e(TAG, "Web API: Run custom commands error", e);
+            return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "application/json",
+                    "{\"error\":\"" + escapeJson(e.getMessage()) + "\"}");
+        }
+    }
+
+    private Response handleExecCommand(IHTTPSession session) {
+        try {
+            Map<String, String> files = new HashMap<>();
+            session.parseBody(files);
+            Map<String, List<String>> params = session.getParameters();
+            List<String> cmdList = params.get("command");
+            String command = (cmdList != null && !cmdList.isEmpty()) ? cmdList.get(0) : null;
+
+            if (command == null || command.trim().isEmpty()) {
+                return newFixedLengthResponse(Response.Status.BAD_REQUEST, "application/json",
+                        "{\"error\":\"Command required\"}");
+            }
+
+            command = command.trim();
+            int port = getActiveAdbPort();
+            if (port <= 0) {
+                return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "application/json",
+                        "{\"error\":\"Active ADB port not found. Please ensure Wireless Debugging is paired and active.\"}");
+            }
+
+            String deviceIP = getDeviceIP();
+            Log.i(TAG, "Web API: Executing interactive shell command '" + command + "' on port " + port);
+            String output = adbHelper.executeShellCommand(deviceIP, port, command);
+            Log.i(TAG, "Web API: Command output: " + output.trim());
+
+            return newFixedLengthResponse(Response.Status.OK, "application/json",
+                    "{\"success\":true,\"command\":\"" + escapeJson(command) + "\",\"output\":\"" + escapeJson(output) + "\"}");
+        } catch (Exception e) {
+            Log.e(TAG, "Web API: Command execution error", e);
+            return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "application/json",
+                    "{\"error\":\"" + escapeJson(e.getMessage()) + "\"}");
+        }
     }
 
     private Response handleSetPort(IHTTPSession session) {
@@ -398,6 +517,19 @@ public class WebServer extends NanoHTTPD {
 
                 if (success) {
                     Log.i(TAG, "Web API: Successfully switched to port " + targetPort);
+                    SharedPreferences prefs = getPrefs();
+                    if (prefs.getBoolean("custom_commands_on_boot", true)) {
+                        String commands = prefs.getString("custom_commands", "");
+                        if (commands != null && !commands.trim().isEmpty()) {
+                            try {
+                                Thread.sleep(1500);
+                                Log.i(TAG, "Web API: Executing custom ADB commands after port switch...");
+                                adbHelper.executeCustomCommands(deviceIP, targetPort, commands);
+                            } catch (Exception ex) {
+                                Log.e(TAG, "Web API: Error running custom commands after port switch", ex);
+                            }
+                        }
+                    }
                 } else {
                     Log.e(TAG, "Web API: Failed to switch to port " + targetPort);
                 }
@@ -540,6 +672,13 @@ public class WebServer extends NanoHTTPD {
                 "        button.warning { background: #ff9800; }\n" +
                 "        button.danger { background: #f44336; }\n" +
                 "        input { padding: 10px; font-size: 14px; border: 1px solid #ddd; border-radius: 4px; width: 200px; margin: 5px; }\n" +
+                "        textarea { width: 100%; box-sizing: border-box; padding: 10px; font-family: 'Courier New', monospace; font-size: 13px; border: 1px solid #ddd; border-radius: 4px; resize: vertical; min-height: 100px; }\n" +
+                "        .form-check { display: flex; align-items: center; margin: 10px 0; }\n" +
+                "        .form-check input { width: auto; margin-right: 10px; }\n" +
+                "        .terminal-box { background: #181824; color: #a6e22e; font-family: 'Courier New', Consolas, monospace; font-size: 13px; padding: 14px; border-radius: 4px; max-height: 280px; overflow-y: auto; white-space: pre-wrap; word-break: break-all; margin-top: 10px; border: 1px solid #333842; user-select: text; }\n" +
+                "        .quick-chips { margin: 8px 0; display: flex; flex-wrap: wrap; gap: 6px; }\n" +
+                "        .chip { background: #e8eaf6; color: #3f51b5; border: 1px solid #c5cae9; padding: 4px 10px; border-radius: 12px; font-size: 12px; cursor: pointer; user-select: none; }\n" +
+                "        .chip:hover { background: #c5cae9; }\n" +
                 "        .status { padding: 8px; border-radius: 4px; margin: 5px 0; }\n" +
                 "        .status.good { background: #d4edda; color: #155724; }\n" +
                 "        .status.bad { background: #f8d7da; color: #721c24; }\n" +
@@ -641,6 +780,49 @@ public class WebServer extends NanoHTTPD {
                 "        <div id=\"switch-info\" class=\"info\"></div>\n" +
                 "    </div>\n" +
                 "    \n" +
+                "    <div class=\"card\" id=\"custom-commands-card\">\n" +
+                "        <h2>⚡ Custom ADB Commands</h2>\n" +
+                "        <div class=\"instruction\">\n" +
+                "            Define custom ADB shell commands to run automatically upon boot / port switch or on demand.<br>\n" +
+                "            Enter one command per line. Lines starting with <code>#</code> are treated as comments.\n" +
+                "        </div>\n" +
+                "        <div class=\"form-check\">\n" +
+                "            <input type=\"checkbox\" id=\"custom-cmd-on-boot\" checked />\n" +
+                "            <label for=\"custom-cmd-on-boot\"><strong>Run automatically after ADB is ready on boot & port switch</strong></label>\n" +
+                "        </div>\n" +
+                "        <div>\n" +
+                "            <textarea id=\"custom-commands-input\" placeholder=\"# Examples:\n# settings put global stay_on_while_plugged_in 3\n# setprop service.adb.tcp.port 5555\n# echo &quot;ADB setup completed&quot;\"></textarea>\n" +
+                "        </div>\n" +
+                "        <div>\n" +
+                "            <button onclick=\"saveCustomCommands()\" class=\"secondary\">💾 Save Commands</button>\n" +
+                "            <button onclick=\"runSavedCustomCommands()\" class=\"warning\">▶️ Run Saved Commands Now</button>\n" +
+                "        </div>\n" +
+                "        <div id=\"custom-cmd-success\" class=\"success\"></div>\n" +
+                "        <div id=\"custom-cmd-error\" class=\"error\"></div>\n" +
+                "        <div id=\"custom-cmd-output\" class=\"terminal-box\" style=\"display:none\"></div>\n" +
+                "    </div>\n" +
+                "    \n" +
+                "    <div class=\"card\" id=\"interactive-terminal-card\">\n" +
+                "        <h2>💻 Interactive ADB Terminal</h2>\n" +
+                "        <div class=\"instruction\">\n" +
+                "            Execute any ADB shell command directly on the device:\n" +
+                "        </div>\n" +
+                "        <div class=\"quick-chips\">\n" +
+                "            <span class=\"chip\" onclick=\"setInteractiveCmd('getprop ro.product.model')\">Model</span>\n" +
+                "            <span class=\"chip\" onclick=\"setInteractiveCmd('settings list global')\">Settings Global</span>\n" +
+                "            <span class=\"chip\" onclick=\"setInteractiveCmd('pm list packages -3')\">User Apps</span>\n" +
+                "            <span class=\"chip\" onclick=\"setInteractiveCmd('dumpsys battery')\">Battery</span>\n" +
+                "            <span class=\"chip\" onclick=\"setInteractiveCmd('uptime')\">Uptime</span>\n" +
+                "            <span class=\"chip\" onclick=\"setInteractiveCmd('top -n 1 -m 5')\">Top CPU</span>\n" +
+                "        </div>\n" +
+                "        <div style=\"display: flex; gap: 8px; align-items: center; margin-top: 8px;\">\n" +
+                "            <input type=\"text\" id=\"interactive-cmd-input\" placeholder=\"e.g. getprop ro.product.model\" style=\"flex: 1; min-width: 180px;\" onkeydown=\"if(event.key==='Enter')executeInteractiveCmd();\" />\n" +
+                "            <button onclick=\"executeInteractiveCmd()\" class=\"secondary\">▶️ Execute</button>\n" +
+                "        </div>\n" +
+                "        <div id=\"exec-cmd-error\" class=\"error\"></div>\n" +
+                "        <div id=\"exec-cmd-output\" class=\"terminal-box\" style=\"display:none\"></div>\n" +
+                "    </div>\n" +
+                "    \n" +
                 "    <div class=\"card\">\n" +
                 "        <h2>🌐 Web Interface Control</h2>\n" +
                 "        <div class=\"instruction\">\n" +
@@ -708,6 +890,14 @@ public class WebServer extends NanoHTTPD {
                 "                    const portInput = document.getElementById('target-port-input');\n" +
                 "                    if (document.activeElement !== portInput) {\n" +
                 "                        portInput.value = data.targetPort;\n" +
+                "                    }\n" +
+                "                    \n" +
+                "                    const cmdInput = document.getElementById('custom-commands-input');\n" +
+                "                    if (document.activeElement !== cmdInput && data.customCommands !== undefined) {\n" +
+                "                        cmdInput.value = data.customCommands;\n" +
+                "                    }\n" +
+                "                    if (data.customCommandsOnBoot !== undefined) {\n" +
+                "                        document.getElementById('custom-cmd-on-boot').checked = data.customCommandsOnBoot;\n" +
                 "                    }\n" +
                 "                    \n" +
                 "                    if (data.isPaired) {\n" +
@@ -795,6 +985,117 @@ public class WebServer extends NanoHTTPD {
                 "            .catch(e => {\n" +
                 "                errorDiv.textContent = 'Error: ' + e.message;\n" +
                 "                errorDiv.style.display = 'block';\n" +
+                "                showResult('Error: ' + e.message, false);\n" +
+                "            });\n" +
+                "        }\n" +
+                "        \n" +
+                "        function saveCustomCommands() {\n" +
+                "            const commands = document.getElementById('custom-commands-input').value;\n" +
+                "            const onBoot = document.getElementById('custom-cmd-on-boot').checked;\n" +
+                "            const successDiv = document.getElementById('custom-cmd-success');\n" +
+                "            const errorDiv = document.getElementById('custom-cmd-error');\n" +
+                "            \n" +
+                "            successDiv.style.display = 'none';\n" +
+                "            errorDiv.style.display = 'none';\n" +
+                "            showActivity('Saving custom commands...');\n" +
+                "            \n" +
+                "            fetch('/api/custom_commands', {\n" +
+                "                method: 'POST',\n" +
+                "                headers: {'Content-Type': 'application/x-www-form-urlencoded'},\n" +
+                "                body: 'commands=' + encodeURIComponent(commands) + '&onBoot=' + onBoot\n" +
+                "            })\n" +
+                "            .then(r => r.json())\n" +
+                "            .then(data => {\n" +
+                "                if (data.success) {\n" +
+                "                    successDiv.textContent = data.message;\n" +
+                "                    successDiv.style.display = 'block';\n" +
+                "                    showResult(data.message, true);\n" +
+                "                    setTimeout(() => { successDiv.style.display = 'none'; }, 3000);\n" +
+                "                } else {\n" +
+                "                    errorDiv.textContent = data.error || 'Failed to save commands';\n" +
+                "                    errorDiv.style.display = 'block';\n" +
+                "                    showResult(data.error || 'Failed to save', false);\n" +
+                "                }\n" +
+                "            })\n" +
+                "            .catch(e => {\n" +
+                "                errorDiv.textContent = 'Error: ' + e.message;\n" +
+                "                errorDiv.style.display = 'block';\n" +
+                "                showResult('Error: ' + e.message, false);\n" +
+                "            });\n" +
+                "        }\n" +
+                "        \n" +
+                "        function runSavedCustomCommands() {\n" +
+                "            const outputDiv = document.getElementById('custom-cmd-output');\n" +
+                "            const errorDiv = document.getElementById('custom-cmd-error');\n" +
+                "            errorDiv.style.display = 'none';\n" +
+                "            outputDiv.style.display = 'block';\n" +
+                "            outputDiv.textContent = 'Executing custom commands...';\n" +
+                "            showActivity('Running custom commands...');\n" +
+                "            \n" +
+                "            fetch('/api/run_custom_commands', {\n" +
+                "                method: 'POST'\n" +
+                "            })\n" +
+                "            .then(r => r.json())\n" +
+                "            .then(data => {\n" +
+                "                if (data.success) {\n" +
+                "                    outputDiv.textContent = data.output || '(Commands completed with no output)';\n" +
+                "                    showResult('Custom commands executed successfully!', true);\n" +
+                "                } else {\n" +
+                "                    errorDiv.textContent = data.error || 'Execution failed';\n" +
+                "                    errorDiv.style.display = 'block';\n" +
+                "                    outputDiv.textContent = 'Error: ' + (data.error || 'Execution failed');\n" +
+                "                    showResult('Command execution failed', false);\n" +
+                "                }\n" +
+                "                refreshLogs();\n" +
+                "            })\n" +
+                "            .catch(e => {\n" +
+                "                errorDiv.textContent = 'Error: ' + e.message;\n" +
+                "                errorDiv.style.display = 'block';\n" +
+                "                outputDiv.textContent = 'Error: ' + e.message;\n" +
+                "                showResult('Error: ' + e.message, false);\n" +
+                "            });\n" +
+                "        }\n" +
+                "        \n" +
+                "        function setInteractiveCmd(cmd) {\n" +
+                "            const input = document.getElementById('interactive-cmd-input');\n" +
+                "            input.value = cmd;\n" +
+                "            input.focus();\n" +
+                "        }\n" +
+                "        \n" +
+                "        function executeInteractiveCmd() {\n" +
+                "            const input = document.getElementById('interactive-cmd-input');\n" +
+                "            const cmd = input.value.trim();\n" +
+                "            if (!cmd) return;\n" +
+                "            \n" +
+                "            const outputDiv = document.getElementById('exec-cmd-output');\n" +
+                "            const errorDiv = document.getElementById('exec-cmd-error');\n" +
+                "            errorDiv.style.display = 'none';\n" +
+                "            outputDiv.style.display = 'block';\n" +
+                "            outputDiv.textContent = 'Executing: ' + cmd + '...';\n" +
+                "            showActivity('Executing command...');\n" +
+                "            \n" +
+                "            fetch('/api/exec', {\n" +
+                "                method: 'POST',\n" +
+                "                headers: {'Content-Type': 'application/x-www-form-urlencoded'},\n" +
+                "                body: 'command=' + encodeURIComponent(cmd)\n" +
+                "            })\n" +
+                "            .then(r => r.json())\n" +
+                "            .then(data => {\n" +
+                "                if (data.success) {\n" +
+                "                    outputDiv.textContent = '$ ' + data.command + '\\n' + (data.output || '(No output)');\n" +
+                "                    showResult('Command executed successfully!', true);\n" +
+                "                } else {\n" +
+                "                    errorDiv.textContent = data.error || 'Execution failed';\n" +
+                "                    errorDiv.style.display = 'block';\n" +
+                "                    outputDiv.textContent = 'Error: ' + (data.error || 'Execution failed');\n" +
+                "                    showResult('Command execution failed', false);\n" +
+                "                }\n" +
+                "                refreshLogs();\n" +
+                "            })\n" +
+                "            .catch(e => {\n" +
+                "                errorDiv.textContent = 'Error: ' + e.message;\n" +
+                "                errorDiv.style.display = 'block';\n" +
+                "                outputDiv.textContent = 'Error: ' + e.message;\n" +
                 "                showResult('Error: ' + e.message, false);\n" +
                 "            });\n" +
                 "        }\n" +

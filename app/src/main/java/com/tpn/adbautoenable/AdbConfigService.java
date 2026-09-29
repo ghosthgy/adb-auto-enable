@@ -34,6 +34,8 @@ public class AdbConfigService extends Service {
     private static final String KEY_LAST_STATUS = "last_status";
     private static final String KEY_LAST_PORT = "last_port";
     private static final String KEY_TARGET_PORT = "target_port";
+    private static final String KEY_CUSTOM_COMMANDS = "custom_commands";
+    private static final String KEY_CUSTOM_COMMANDS_ON_BOOT = "custom_commands_on_boot";
     private static final int INITIAL_BOOT_DELAY_SECONDS = 30;
     private static final int MAX_RETRY_ATTEMPTS = 3;
     private static final int RETRY_DELAY_SECONDS = 10;
@@ -409,6 +411,7 @@ public class AdbConfigService extends Service {
                 Log.i(TAG, "Successfully configured ADB on port " + targetPort + "!");
                 updateStatus("Success - ADB on port " + targetPort);
                 updateNotification("Success - ADB on port " + targetPort);
+                runCustomCommandsIfConfigured(deviceIP, targetPort);
                 return true;
             } else {
                 Log.e(TAG, "Failed to switch to port " + targetPort);
@@ -593,6 +596,28 @@ public class AdbConfigService extends Service {
 
     private void updateStatus(String status) {
         getPrefs().edit().putString(KEY_LAST_STATUS, status).apply();
+    }
+
+    private void runCustomCommandsIfConfigured(String deviceIP, int targetPort) {
+        SharedPreferences prefs = getPrefs();
+        boolean enabled = prefs.getBoolean(KEY_CUSTOM_COMMANDS_ON_BOOT, true);
+        String customCommands = prefs.getString(KEY_CUSTOM_COMMANDS, "");
+        if (!enabled || customCommands == null || customCommands.trim().isEmpty()) {
+            return;
+        }
+
+        new Thread(() -> {
+            try {
+                Log.i(TAG, "Waiting 2000ms before executing custom ADB commands on target port " + targetPort + "...");
+                Thread.sleep(2000);
+                AdbHelper helper = new AdbHelper(this);
+                Log.i(TAG, "Starting automatic execution of custom ADB commands on boot...");
+                String result = helper.executeCustomCommands(deviceIP, targetPort, customCommands);
+                Log.i(TAG, "Finished automatic execution of custom ADB commands:\n" + result);
+            } catch (Exception e) {
+                Log.e(TAG, "Failed to execute custom ADB commands on boot", e);
+            }
+        }, "custom-commands-runner").start();
     }
 
     private void saveLastPort(int port) {

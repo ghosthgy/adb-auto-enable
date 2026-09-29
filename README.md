@@ -93,7 +93,8 @@ The web server runs on port 9093 in a foreground service. If you can't access it
 5. **Stabilization & Network Wait**: Service waits for an active Wi-Fi/Ethernet IP and allows a 30-second system stabilization period.
 6. **Port Discovery**: Discovers the randomized ADB port using mDNS or a 64-thread parallel socket sweep (`32768–60999`).
 7. **Self-Connection & Switch**: Connects to the local ADB daemon (127.0.0.1 loopback -> device LAN IP fallback) and sends the tcpip:<target_port> command.
-8. **Done!**: ADB is available on your target port for external connections!
+8. **Custom ADB Commands**: Automatically connects to local ADB and executes user-defined custom ADB shell commands (if configured).
+9. **Done!**: ADB is available on your target port for external connections!
 
 ## Technical Details
 
@@ -134,6 +135,8 @@ Step 3: Discover randomized ADB port (mDNS → 64-thread socket sweep fallback)
 Step 4: Connect to ADB daemon (127.0.0.1 loopback → Device LAN IP fallback)
   ↓
 Send tcpip:<target_port> command
+  ↓
+Execute Custom ADB Commands (if configured)
   ↓
 Success! (with 3 retry attempts if needed)
 ```

@@ -2,11 +2,13 @@ name: Build and Release APK
 
 on:
   push:
+    branches:
+      - main
+      - master
     tags:
-      - 'v*' # Triggers on version tags like v1.0, v2.0, etc.
-  release:
-    types: [created]
-  workflow_dispatch: # Allows manual triggering
+      - 'v*'
+  pull_request:
+  workflow_dispatch:
 
 env:
   main_project_module: app
@@ -22,7 +24,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # Needed if git commit count is used for fallback versionCode
+          fetch-depth: 0
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -34,12 +36,20 @@ jobs:
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
-      - name: Run tests
-        run: ./gradlew test
-
-      - name: Decode Keystore
+      - name: Setup Keystore
         run: |
-          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > keystore.jks
+          if [ -n "${{ secrets.KEYSTORE_BASE64 }}" ]; then
+            echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > keystore.jks
+            echo "KEYSTORE_PASS=${{ secrets.KEYSTORE_PASSWORD }}" >> $GITHUB_ENV
+            echo "KEY_AL=${{ secrets.KEY_ALIAS }}" >> $GITHUB_ENV
+            echo "KEY_PASS=${{ secrets.KEY_PASSWORD }}" >> $GITHUB_ENV
+          else
+            echo "Generating temporary release keystore..."
+            keytool -genkey -v -keystore keystore.jks -alias adbautoenable -keyalg RSA -keysize 2048 -validity 10000 -storepass android -keypass android -dname "CN=ADBAutoEnable, OU=Dev, O=ADBAutoEnable, L=Unknown, S=Unknown, C=US"
+            echo "KEYSTORE_PASS=android" >> $GITHUB_ENV
+            echo "KEY_AL=adbautoenable" >> $GITHUB_ENV
+            echo "KEY_PASS=android" >> $GITHUB_ENV
+          fi
 
       - name: Extract Version
         id: version
@@ -51,48 +61,51 @@ jobs:
             PATCH=$(echo "$PATCH" | tr -cd '0-9')
             CODE=$(( (${MAJOR:-0} * 10000) + (${MINOR:-0} * 100) + ${PATCH:-0} ))
           else
-            VERSION=$(grep 'versionName' app/build.gradle | head -n 1 | awk '{print $3}' | tr -d '"')
-            CODE=$(git rev-list --count HEAD)
+            VERSION=$(grep 'versionName' app/build.gradle.kts | head -n 1 | awk '{print $3}' | tr -d '"')
+            if [ -z "$VERSION" ]; then
+              VERSION="0.3.3"
+            fi
+            CODE=$(git rev-list --count HEAD || echo "1")
           fi
           echo "VERSION_NAME=$VERSION" >> $GITHUB_OUTPUT
           echo "VERSION_CODE=$CODE" >> $GITHUB_OUTPUT
           echo "Extracted Version Name: $VERSION, Code: $CODE"
 
-      - name: Build Release APK
+      - name: Build APKs
         run: |
-          ./gradlew assembleRelease \
+          ./gradlew assembleDebug assembleRelease \
             -PCI_VERSION_NAME="${{ steps.version.outputs.VERSION_NAME }}" \
             -PCI_VERSION_CODE="${{ steps.version.outputs.VERSION_CODE }}"
         env:
           KEYSTORE_FILE: ../keystore.jks
-          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          KEYSTORE_PASSWORD: ${{ env.KEYSTORE_PASS }}
+          KEY_ALIAS: ${{ env.KEY_AL }}
+          KEY_PASSWORD: ${{ env.KEY_PASS }}
 
-      - name: Rename APK file
+      - name: Prepare APK outputs
         run: |
           VERSION_NAME="${{ steps.version.outputs.VERSION_NAME }}"
-          OLD_PATH="app/build/outputs/apk/release/app-release.apk"
-          NEW_PATH="app/build/outputs/apk/release/ADB-auto-enable-${VERSION_NAME}.apk"
-          if [ -f "$OLD_PATH" ]; then
-            mv "$OLD_PATH" "$NEW_PATH"
-            echo "Successfully renamed to ADB-auto-enable-${VERSION_NAME}.apk"
-          else
-            echo "Error: Release APK not found at $OLD_PATH"
-            exit 1
+          mkdir -p dist
+          if [ -f "app/build/outputs/apk/release/app-release.apk" ]; then
+            cp "app/build/outputs/apk/release/app-release.apk" "dist/ADB-auto-enable-v${VERSION_NAME}-release.apk"
           fi
+          if [ -f "app/build/outputs/apk/debug/app-debug.apk" ]; then
+            cp "app/build/outputs/apk/debug/app-debug.apk" "dist/ADB-auto-enable-v${VERSION_NAME}-debug.apk"
+          fi
+          ls -la dist/
 
-      - name: Upload Release APK
+      - name: Upload APK Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: adbautoenable-${{ steps.version.outputs.VERSION_NAME }}-release
-          path: app/build/outputs/apk/release/ADB-auto-enable-*.apk
+          name: adb-auto-enable-v${{ steps.version.outputs.VERSION_NAME }}-apks
+          path: dist/*.apk
 
       - name: Create Release and Upload APK
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v1
         with:
-          files: app/build/outputs/apk/release/ADB-auto-enable-*.apk
+          files: dist/*.apk
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+

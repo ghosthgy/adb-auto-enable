@@ -116,6 +116,18 @@ public class AdbHelper {
         }
     }
 
+    public String executeShellCommand(String host, int port, String command) throws Exception {
+        try {
+            return executeShellInternal("127.0.0.1", port, command);
+        } catch (Exception e) {
+            if (host != null && !host.equals("127.0.0.1") && !host.equals("0.0.0.0")) {
+                Log.i(TAG, "Shell execution failed via loopback, retrying via " + host + ": " + e.getMessage());
+                return executeShellInternal(host, port, command);
+            }
+            throw e;
+        }
+    }
+
     private String executeShell(SimpleAdbManager manager, String command) throws Exception {
         StringBuilder output = new StringBuilder();
         try (AdbStream stream = manager.openStream("shell:" + command);
@@ -134,6 +146,58 @@ public class AdbHelper {
             }
         }
         return output.toString();
+    }
+
+    private String executeShellInternal(String host, int port, String command) throws Exception {
+        try (SimpleAdbManager manager = new SimpleAdbManager(context)) {
+            manager.connect(host, port);
+            return executeShell(manager, command);
+        }
+    }
+
+    public String executeCustomCommands(String host, int port, String commands) throws Exception {
+        if (commands == null || commands.trim().isEmpty()) {
+            return "";
+        }
+        String[] lines = commands.split("\\r?\\n");
+        try {
+            return executeBatchCommandsInternal("127.0.0.1", port, lines);
+        } catch (Exception e) {
+            if (host != null && !host.equals("127.0.0.1") && !host.equals("0.0.0.0")) {
+                Log.i(TAG, "Batch execution failed via loopback, retrying via " + host + ": " + e.getMessage());
+                return executeBatchCommandsInternal(host, port, lines);
+            }
+            throw e;
+        }
+    }
+
+    private String executeBatchCommandsInternal(String host, int port, String[] lines) throws Exception {
+        StringBuilder results = new StringBuilder();
+        try (SimpleAdbManager manager = new SimpleAdbManager(context)) {
+            manager.connect(host, port);
+            for (String line : lines) {
+                String cmd = line.trim();
+                if (cmd.isEmpty() || cmd.startsWith("#")) {
+                    continue;
+                }
+                Log.i(TAG, "Executing custom ADB command: " + cmd);
+                results.append("$ ").append(cmd).append("\n");
+                try {
+                    String output = executeShell(manager, cmd);
+                    if (!output.isEmpty()) {
+                        results.append(output);
+                        if (!output.endsWith("\n")) {
+                            results.append("\n");
+                        }
+                    }
+                    Log.i(TAG, "Command '" + cmd + "' output: " + output.trim());
+                } catch (Exception cmdEx) {
+                    Log.e(TAG, "Error executing command '" + cmd + "': " + cmdEx.getMessage());
+                    results.append("ERROR: ").append(cmdEx.getMessage()).append("\n");
+                }
+            }
+        }
+        return results.toString();
     }
 
     public boolean selfGrantPermission(String host, int port, String packageName, String permission) {
